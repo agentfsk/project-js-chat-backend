@@ -3,7 +3,9 @@
 import _ from 'lodash';
 import HttpErrors from 'http-errors';
 
-const { Unauthorized, Conflict } = HttpErrors;
+import { storeUpload } from './uploads.js';
+
+const { Unauthorized, Conflict, BadRequest } = HttpErrors;
 
 const getNextId = () => Number(_.uniqueId());
 
@@ -175,4 +177,28 @@ export default (app, defaultState = {}) => {
       const { port } = app.server.address();
       reply.type('text/html; charset=utf-8').send(renderLanding(port));
     });
+
+  app.post('/api/v1/uploads', async (req, reply) => {
+    const file = await req.file();
+
+    if (!file) {
+      reply.send(new BadRequest('Файл не получен'));
+      return;
+    }
+
+    try {
+      const attachment = await storeUpload(file);
+      reply.send(attachment);
+    } catch (err) {
+      if (err instanceof BadRequest) {
+        reply.send(err);
+        return;
+      }
+      if (err.name === 'RequestFileTooLargeError') {
+        reply.code(err.statusCode || 413).send({ error: 'Файл слишком большой' });
+        return;
+      }
+      throw err;
+    }
+  });
 };

@@ -2,3 +2,5 @@
 *.log
 dist
 .env
+uploads/
+package-lock.json
