@@ -3,7 +3,7 @@
 import _ from 'lodash';
 import HttpErrors from 'http-errors';
 
-import { storeUpload } from './uploads.js';
+import { storeAvatar, storeUpload } from './uploads.js';
 
 const { Unauthorized, BadRequest } = HttpErrors;
 
@@ -12,6 +12,56 @@ const getNextId = () => Number(_.uniqueId());
 const FRONTEND_URL = process.env.FRONTEND_URL || '#';
 const BACKEND_REPO_URL = process.env.BACKEND_REPO_URL || '#';
 const FRONTEND_REPO_URL = process.env.FRONTEND_REPO_URL || '#';
+
+const publicProfile = (user) => ({
+  id: user.id,
+  username: user.username,
+  avatarUrl: user.avatarUrl || null,
+});
+
+const isPrivateChannel = (channel) => (
+  Boolean(channel.private) && Array.isArray(channel.participants)
+);
+
+const hasAccess = (channel, userId) => (
+  !isPrivateChannel(channel) || channel.participants.includes(userId)
+);
+
+const emitToChannel = (app, channel, eventName, payload) => {
+  if (isPrivateChannel(channel)) {
+    channel.participants.forEach((userId) => {
+      app.io.to(`user:${userId}`).emit(eventName, payload);
+    });
+    return;
+  }
+  app.io.emit(eventName, payload);
+};
+
+const findPrivateChannel = (state, firstId, secondId) => (
+  state.channels.find((channel) => (
+    isPrivateChannel(channel)
+    && channel.participants.includes(firstId)
+    && channel.participants.includes(secondId)
+  ))
+);
+
+const getOrCreatePrivateChannel = (state, firstId, secondId) => {
+  const existing = findPrivateChannel(state, firstId, secondId);
+  if (existing) return existing;
+
+  const peer = state.users.find((user) => user.id === secondId);
+  const channel = {
+    id: getNextId(),
+    name: peer ? peer.username : 'ЛС',
+    removable: false,
+    private: true,
+    participants: [firstId, secondId],
+  };
+  state.channels.push(channel);
+  return channel;
+};
+
+const getCurrentUser = (req, state) => state.users.find((user) => user.id === req.user.userId);
 
 const renderLanding = (port) => `<!doctype html>
 <html lang="ru">
@@ -53,9 +103,15 @@ const buildState = (defaultState) => {
     ],
     messages: [],
     currentChannelId: generalChannelId,
+    contactRequests: [],
     users: [
       {
-        id: 1, username: 'admin', email: 'admin@example.com', password: 'admin',
+        id: 1,
+        username: 'admin',
+        email: 'admin@example.com',
+        password: 'admin',
+        avatarUrl: null,
+        contacts: [],
       },
     ],
   };
@@ -82,9 +138,19 @@ export default (app, defaultState = {}) => {
   const state = buildState(defaultState);
 
   app.io.on('connect', (socket) => {
-    console.log({ 'socket.id': socket.id });
+    console.log({ 'socket.id': socket.id, userId: socket.userId });
 
     socket.on('newMessage', (message, acknowledge = _.noop) => {
+      const channel = state.channels.find((c) => c.id === Number(message.channelId));
+      if (!channel) {
+        acknowledge({ status: 'error', message: 'Канал не найден' });
+        return;
+      }
+      if (!hasAccess(channel, socket.userId)) {
+        acknowledge({ status: 'error', message: 'Доступ запрещён' });
+        return;
+      }
+
       const messageWithId = {
         ...message,
         id: getNextId(),
@@ -92,6 +158,14 @@ export default (app, defaultState = {}) => {
       // @ts-ignore
       state.messages.push(messageWithId);
       acknowledge({ status: 'ok' });
+
+      if (isPrivateChannel(channel)) {
+        emitToChannel(app, channel, 'newMessage', {
+          ...messageWithId,
+          channel,
+        });
+        return;
+      }
       app.io.emit('newMessage', messageWithId);
     });
 
@@ -109,6 +183,12 @@ export default (app, defaultState = {}) => {
 
     socket.on('removeChannel', ({ id }, acknowledge = _.noop) => {
       const channelId = Number(id);
+      const channel = state.channels.find((c) => c.id === channelId);
+      if (!channel || isPrivateChannel(channel)) {
+        acknowledge({ status: 'error', message: 'Канал не может быть удалён' });
+        return;
+      }
+
       state.channels = state.channels.filter((c) => c.id !== channelId);
       // @ts-ignore
       state.messages = state.messages.filter((m) => m.channelId !== channelId);
@@ -121,11 +201,14 @@ export default (app, defaultState = {}) => {
     socket.on('renameChannel', ({ id, name }, acknowledge = _.noop) => {
       const channelId = Number(id);
       const channel = state.channels.find((c) => c.id === channelId);
-      if (!channel) return;
+      if (!channel || isPrivateChannel(channel)) {
+        acknowledge({ status: 'error', message: 'Канал не может быть переименован' });
+        return;
+      }
       channel.name = name;
 
       acknowledge({ status: 'ok' });
-      app.io.emit('renameChannel', channel);
+      emitToChannel(app, channel, 'renameChannel', channel);
     });
   });
 
@@ -162,7 +245,7 @@ export default (app, defaultState = {}) => {
     }
 
     const newUser = {
-      id: getNextId(), username, email, password,
+      id: getNextId(), username, email, password, avatarUrl: null, contacts: [],
     };
     const token = app.jwt.sign({ userId: newUser.id });
     state.users.push(newUser);
@@ -173,16 +256,47 @@ export default (app, defaultState = {}) => {
   });
 
   app.get('/api/v1/data', { preValidation: [app.authenticate] }, (req, reply) => {
-    const user = state.users.find(({ id }) => id === req.user.userId);
-
+    const user = getCurrentUser(req, state);
     if (!user) {
       reply.send(new Unauthorized());
       return;
     }
 
+    const channels = state.channels.filter((channel) => hasAccess(channel, user.id));
+    const channelIds = new Set(channels.map((channel) => channel.id));
+    // @ts-ignore
+    const messages = state.messages.filter((message) => channelIds.has(message.channelId));
+    const contacts = state.users
+      .filter((candidate) => user.contacts.includes(candidate.id))
+      .map(publicProfile);
+    const requests = state.contactRequests
+      .filter((request) => (
+        request.toUserId === user.id && request.status === 'pending'
+      ))
+      .map((request) => {
+        const fromUser = state.users.find((candidate) => candidate.id === request.fromUserId);
+        return {
+          id: request.id,
+          from: publicProfile(fromUser),
+          channelId: request.channelId,
+        };
+      });
+
+    let { currentChannelId } = state;
+    if (!channelIds.has(currentChannelId) && channels.length > 0) {
+      currentChannelId = channels[0].id;
+    }
+
     reply
       .header('Content-Type', 'application/json; charset=utf-8')
-      .send(_.omit(state, 'users'));
+      .send({
+        channels,
+        messages,
+        currentChannelId,
+        me: publicProfile(user),
+        contacts,
+        requests,
+      });
   });
 
   app
@@ -213,5 +327,255 @@ export default (app, defaultState = {}) => {
       }
       throw err;
     }
+  });
+
+  app.get('/api/v1/users/search', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+
+    const query = _.trim(String(req.query.query || '')).toLowerCase();
+    const results = state.users
+      .filter((candidate) => (
+        candidate.id !== user.id
+        && query
+        && candidate.username.toLowerCase().includes(query)
+      ))
+      .map(publicProfile);
+
+    reply.send(results);
+  });
+
+  app.patch('/api/v1/users/me', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+
+    const { username, avatarUrl } = req.body || {};
+    let changed = false;
+
+    if (
+      username !== undefined
+      && String(username).trim()
+      && String(username).trim() !== user.username
+    ) {
+      const newUsername = String(username).trim();
+
+      if (state.users.some((candidate) => (
+        candidate.id !== user.id && candidate.username === newUsername
+      ))) {
+        reply.code(409).send({ error: 'Этот ник уже используется' });
+        return;
+      }
+
+      const oldUsername = user.username;
+      user.username = newUsername;
+      // @ts-ignore
+      for (let index = 0; index < state.messages.length; index += 1) {
+        if (state.messages[index].username === oldUsername) {
+          state.messages[index].username = newUsername;
+        }
+      }
+      state.channels.forEach((channel) => {
+        if (
+          isPrivateChannel(channel)
+          && channel.participants.includes(user.id)
+          && channel.name === oldUsername
+        ) {
+          const channelIndex = state.channels.indexOf(channel);
+          state.channels.splice(channelIndex, 1, {
+            ...channel,
+            name: newUsername,
+          });
+        }
+      });
+      changed = true;
+    }
+
+    if (avatarUrl !== undefined) {
+      user.avatarUrl = avatarUrl ? String(avatarUrl) : null;
+      changed = true;
+    }
+
+    reply.send(publicProfile(user));
+
+    if (changed) {
+      app.io.emit('userUpdated', {
+        id: user.id,
+        username: user.username,
+        avatarUrl: user.avatarUrl,
+      });
+    }
+  });
+
+  app.post('/api/v1/avatars', { preValidation: [app.authenticate] }, async (req, reply) => {
+    const file = await req.file();
+
+    if (!file) {
+      reply.send(new BadRequest('Файл не получен'));
+      return;
+    }
+
+    try {
+      const avatar = await storeAvatar(file);
+      reply.send(avatar);
+    } catch (err) {
+      if (err instanceof BadRequest) {
+        reply.send(err);
+        return;
+      }
+      if (err.name === 'RequestFileTooLargeError') {
+        reply.code(err.statusCode || 413).send({ error: 'Файл слишком большой' });
+        return;
+      }
+      throw err;
+    }
+  });
+
+  app.post('/api/v1/private-channels', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+
+    const targetId = Number(_.get(req.body, 'userId'));
+    const target = state.users.find((candidate) => candidate.id === targetId);
+    if (!target) {
+      reply.code(404).send({ error: 'Пользователь не найден' });
+      return;
+    }
+
+    const channel = getOrCreatePrivateChannel(state, user.id, target.id);
+    reply.send({ channel });
+  });
+
+  app.post('/api/v1/contacts', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+
+    const targetId = Number(_.get(req.body, 'userId'));
+    const target = state.users.find((candidate) => candidate.id === targetId);
+    if (!target) {
+      reply.code(404).send({ error: 'Пользователь не найден' });
+      return;
+    }
+
+    const channel = getOrCreatePrivateChannel(state, user.id, target.id);
+
+    if (user.contacts.includes(targetId)) {
+      reply.send({ requestId: null, channel, status: 'accepted' });
+      return;
+    }
+
+    const existing = state.contactRequests.find((request) => (
+      request.status === 'pending'
+      && request.fromUserId === user.id
+      && request.toUserId === targetId
+    ));
+    if (existing) {
+      reply.send({ requestId: existing.id, channel, status: 'pending' });
+      return;
+    }
+
+    const request = {
+      id: getNextId(),
+      fromUserId: user.id,
+      toUserId: targetId,
+      channelId: channel.id,
+      status: 'pending',
+    };
+    state.contactRequests.push(request);
+
+    app.io.to(`user:${targetId}`).emit('contactRequest', {
+      requestId: request.id,
+      from: publicProfile(user),
+      channel,
+    });
+
+    reply.send({ requestId: request.id, channel, status: 'pending' });
+  });
+
+  app.post('/api/v1/contacts/:requestId/accept', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+
+    const requestId = Number(req.params.requestId);
+    const request = state.contactRequests.find((candidate) => (
+      candidate.id === requestId && candidate.toUserId === user.id
+    ));
+    if (!request) {
+      reply.code(404).send({ error: 'Запрос не найден' });
+      return;
+    }
+
+    const fromUser = state.users.find((candidate) => candidate.id === request.fromUserId);
+    state.contactRequests = state.contactRequests.filter((candidate) => candidate.id !== requestId);
+
+    if (fromUser) {
+      if (!fromUser.contacts.includes(user.id)) fromUser.contacts.push(user.id);
+      if (!user.contacts.includes(fromUser.id)) user.contacts.push(fromUser.id);
+      app.io.to(`user:${fromUser.id}`).emit('contactAdded', { profile: publicProfile(user) });
+      app.io.to(`user:${user.id}`).emit('contactAdded', { profile: publicProfile(fromUser) });
+    }
+    app.io.to(`user:${fromUser.id}`).emit('contactRequestResolved', { requestId, accepted: true });
+
+    reply.send({ ok: true });
+  });
+
+  app.post('/api/v1/contacts/:requestId/decline', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+
+    const requestId = Number(req.params.requestId);
+    const request = state.contactRequests.find((candidate) => (
+      candidate.id === requestId && candidate.toUserId === user.id
+    ));
+    if (!request) {
+      reply.code(404).send({ error: 'Запрос не найден' });
+      return;
+    }
+
+    state.contactRequests = state.contactRequests.filter((candidate) => candidate.id !== requestId);
+    app.io.to(`user:${request.fromUserId}`).emit('contactRequestResolved', { requestId, accepted: false });
+
+    reply.send({ ok: true });
+  });
+
+  app.delete('/api/v1/contacts/:userId', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+
+    const targetId = Number(req.params.userId);
+    if (!user.contacts.includes(targetId)) {
+      reply.code(404).send({ error: 'Контакт не найден' });
+      return;
+    }
+
+    user.contacts = user.contacts.filter((id) => id !== targetId);
+    const target = state.users.find((candidate) => candidate.id === targetId);
+    if (target) {
+      target.contacts = target.contacts.filter((id) => id !== user.id);
+    }
+    app.io.to(`user:${user.id}`).emit('contactRemoved', { userId: targetId });
+    app.io.to(`user:${targetId}`).emit('contactRemoved', { userId: user.id });
+
+    reply.send({ ok: true });
   });
 };

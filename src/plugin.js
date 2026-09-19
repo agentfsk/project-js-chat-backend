@@ -13,7 +13,6 @@ import { ensureUploadDir, uploadDir, uploadSizeLimit } from './uploads.js';
 const { Unauthorized } = HttpErrors;
 
 const setUpAuth = (app) => {
-  // TODO add socket auth
   app
     .register(fastifyJWT, {
       secret: 'supersecret',
@@ -27,6 +26,25 @@ const setUpAuth = (app) => {
     });
 };
 
+const setUpSocketAuth = (app) => {
+  app.io.use((socket, next) => {
+    const token = socket?.handshake?.auth?.token;
+    if (!token) {
+      next(new Error('unauthorized'));
+      return;
+    }
+    try {
+      const payload = app.jwt.verify(token);
+      // eslint-disable-next-line no-param-reassign
+      socket.userId = payload.userId;
+      socket.join(`user:${payload.userId}`);
+      next();
+    } catch (_err) {
+      next(new Error('unauthorized'));
+    }
+  });
+};
+
 export default async (app, options) => {
   setUpAuth(app);
   await app.register(fastifyCors, {
@@ -38,6 +56,7 @@ export default async (app, options) => {
       methods: ['GET', 'POST'],
     },
   });
+  setUpSocketAuth(app);
   ensureUploadDir();
   await app.register(fastifyStatic, {
     root: uploadDir,

@@ -11,6 +11,7 @@ const { BadRequest } = HttpErrors;
 
 export const uploadDir = join(process.cwd(), 'uploads');
 export const uploadSizeLimit = 5 * 1024 * 1024;
+export const avatarSizeLimit = 1 * 1024 * 1024;
 
 export const allowedTypes = {
   'image/png': '.png',
@@ -24,6 +25,20 @@ export const allowedTypes = {
   'application/pdf': '.pdf',
 };
 
+export const avatarTypes = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+};
+
+function tooLarge() {
+  const err = new Error('Файл слишком большой');
+  err.name = 'RequestFileTooLargeError';
+  err.statusCode = 413;
+  return err;
+}
+
 export function ensureUploadDir() {
   mkdirSync(uploadDir, { recursive: true });
 }
@@ -36,13 +51,32 @@ export async function storeUpload(file) {
 
   const buffer = await file.toBuffer();
   if (file.file.truncated) {
-    const err = new Error('Файл слишком большой');
-    err.name = 'RequestFileTooLargeError';
-    err.statusCode = 413;
-    throw err;
+    throw tooLarge();
   }
 
   const storedName = `${Date.now()}-${randomUUID()}${extension}`;
+  await writeFile(join(uploadDir, storedName), buffer);
+
+  return {
+    name: file.filename,
+    mime: file.mimetype,
+    size: buffer.length,
+    url: `/uploads/${storedName}`,
+  };
+}
+
+export async function storeAvatar(file) {
+  const extension = avatarTypes[file.mimetype];
+  if (!extension) {
+    throw new BadRequest('Недопустимый тип файла');
+  }
+
+  const buffer = await file.toBuffer();
+  if (file.file.truncated || buffer.length > avatarSizeLimit) {
+    throw tooLarge();
+  }
+
+  const storedName = `avatar-${Date.now()}-${randomUUID()}${extension}`;
   await writeFile(join(uploadDir, storedName), buffer);
 
   return {
