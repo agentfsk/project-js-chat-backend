@@ -49,6 +49,7 @@ export default async (app, options) => {
   setUpAuth(app);
   await app.register(fastifyCors, {
     origin: '*',
+    methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE'],
   });
   await app.register(fastifySocketIo, {
     cors: {
