@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: chat-backend
+    runtime: node
+    plan: free
+    buildCommand: pnpm i
+    startCommand: pnpm start
+    healthCheckPath: /
+    envVars:
+      - key: FRONTEND_URL
+        sync: false
