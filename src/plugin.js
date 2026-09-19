@@ -12,16 +12,6 @@ import { ensureUploadDir, uploadDir, uploadSizeLimit } from './uploads.js';
 
 const { Unauthorized } = HttpErrors;
 
-const setUpStaticAssets = (app, buildPath) => {
-  app.register(fastifyStatic, {
-    root: buildPath,
-  });
-
-  app.setNotFoundHandler((req, res) => {
-    res.code(404).send({ error: 'not found' });
-  });
-};
-
 const setUpAuth = (app) => {
   // TODO add socket auth
   app
@@ -46,7 +36,7 @@ export default async (app, options) => {
     cors: {
       origin: '*',
       methods: ['GET', 'POST'],
-    }
+    },
   });
   ensureUploadDir();
   await app.register(fastifyStatic, {

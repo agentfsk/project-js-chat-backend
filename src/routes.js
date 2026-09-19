@@ -5,7 +5,7 @@ import HttpErrors from 'http-errors';
 
 import { storeUpload } from './uploads.js';
 
-const { Unauthorized, Conflict, BadRequest } = HttpErrors;
+const { Unauthorized, BadRequest } = HttpErrors;
 
 const getNextId = () => Number(_.uniqueId());
 
@@ -54,7 +54,9 @@ const buildState = (defaultState) => {
     messages: [],
     currentChannelId: generalChannelId,
     users: [
-      { id: 1, username: 'admin', password: 'admin' },
+      {
+        id: 1, username: 'admin', email: 'admin@example.com', password: 'admin',
+      },
     ],
   };
 
@@ -69,6 +71,7 @@ const buildState = (defaultState) => {
     state.currentChannelId = defaultState.currentChannelId;
   }
   if (defaultState.users) {
+    // Default users must carry an `email`, like the seeded admin.
     state.users.push(...defaultState.users);
   }
 
@@ -127,9 +130,12 @@ export default (app, defaultState = {}) => {
   });
 
   app.post('/api/v1/login', async (req, reply) => {
-    const username = _.get(req.body, 'username');
+    const identifier = _.get(req.body, 'identifier');
     const password = _.get(req.body, 'password');
-    const user = state.users.find((u) => u.username === username);
+    const normalizedEmail = _.trim(String(identifier || '')).toLowerCase();
+    const user = state.users.find((u) => (
+      u.email === normalizedEmail || u.username === identifier
+    ));
 
     if (!user || user.password !== password) {
       reply.send(new Unauthorized());
@@ -137,20 +143,27 @@ export default (app, defaultState = {}) => {
     }
 
     const token = app.jwt.sign({ userId: user.id });
-    reply.send({ token, username });
+    reply.send({ token, username: user.username });
   });
 
   app.post('/api/v1/signup', async (req, reply) => {
+    const email = _.get(req.body, 'email', '').trim().toLowerCase();
     const username = _.get(req.body, 'username');
     const password = _.get(req.body, 'password');
-    const user = state.users.find((u) => u.username === username);
 
-    if (user) {
-      reply.send(new Conflict());
+    if (state.users.some((u) => u.email === email)) {
+      reply.code(409).send({ error: 'Этот email уже используется' });
       return;
     }
 
-    const newUser = { id: getNextId(), username, password };
+    if (state.users.some((u) => u.username === username)) {
+      reply.code(409).send({ error: 'Этот ник уже используется' });
+      return;
+    }
+
+    const newUser = {
+      id: getNextId(), username, email, password,
+    };
     const token = app.jwt.sign({ userId: newUser.id });
     state.users.push(newUser);
     reply

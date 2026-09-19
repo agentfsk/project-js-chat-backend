@@ -32,8 +32,10 @@ Options:
 
 `/api/v1/login`
 
+Sign in with either the registered email or the nickname:
+
 ```javascript
-axios.post('/api/v1/login', { username: 'admin', password: 'admin' }).then((response) => {
+axios.post('/api/v1/login', { identifier: 'admin@example.com', password: 'admin' }).then((response) => {
   console.log(response.data); // => { token: ..., username: 'admin' }
 });
 ```
@@ -57,7 +59,7 @@ axios.get('/api/v1/data', {
 `/api/v1/signup`
 
 ```javascript
-axios.post('/api/v1/signup', { username: 'newuser', password: '123456' }).then((response) => {
+axios.post('/api/v1/signup', { email: 'user@example.com', username: 'newuser', password: '123456' }).then((response) => {
   console.log(response.data); // => { token: ..., username: 'newuser' }
 });
 ```

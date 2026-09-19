@@ -10,3 +10,6 @@ parserOptions:
 rules: 
   import/extensions: 0
   no-console: 0
+settings:
+  jest:
+    version: 27
