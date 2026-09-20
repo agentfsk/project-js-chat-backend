@@ -17,7 +17,13 @@ const publicProfile = (user) => ({
   id: user.id,
   username: user.username,
   avatarUrl: user.avatarUrl || null,
+  role: user.role || 'user',
 });
+
+const isAdminUser = (state, userId) => {
+  const user = state.users.find((candidate) => candidate.id === userId);
+  return Boolean(user && user.role === 'admin');
+};
 
 const isPrivateChannel = (channel) => (
   Boolean(channel.private) && Array.isArray(channel.participants)
@@ -62,6 +68,15 @@ const getOrCreatePrivateChannel = (state, firstId, secondId) => {
 };
 
 const getCurrentUser = (req, state) => state.users.find((user) => user.id === req.user.userId);
+
+const findMessageAndChannel = (state, messageId) => {
+  const id = Number(messageId);
+  const message = state.messages.find((candidate) => candidate.id === id);
+  if (!message) return null;
+  const channel = state.channels.find((candidate) => candidate.id === message.channelId);
+  if (!channel) return null;
+  return { message, channel };
+};
 
 const renderLanding = (port) => `<!doctype html>
 <html lang="ru">
@@ -112,6 +127,7 @@ const buildState = (defaultState) => {
         password: 'admin',
         avatarUrl: null,
         contacts: [],
+        role: 'admin',
       },
     ],
   };
@@ -151,9 +167,15 @@ export default (app, defaultState = {}) => {
         return;
       }
 
+      const sender = state.users.find((candidate) => candidate.id === socket.userId);
       const messageWithId = {
         ...message,
         id: getNextId(),
+        userId: socket.userId,
+        username: message.username || (sender ? sender.username : ''),
+        createdAt: new Date().toISOString(),
+        edited: false,
+        pinned: false,
       };
       // @ts-ignore
       state.messages.push(messageWithId);
@@ -167,6 +189,80 @@ export default (app, defaultState = {}) => {
         return;
       }
       app.io.emit('newMessage', messageWithId);
+    });
+
+    socket.on('editMessage', ({ messageId, body }, acknowledge = _.noop) => {
+      const found = findMessageAndChannel(state, messageId);
+      if (!found) {
+        acknowledge({ status: 'error', message: 'Сообщение не найдено' });
+        return;
+      }
+      const { message, channel } = found;
+      if (!hasAccess(channel, socket.userId)) {
+        acknowledge({ status: 'error', message: 'Доступ запрещён' });
+        return;
+      }
+      const isAuthor = message.userId === socket.userId;
+      if (!isAuthor && !isAdminUser(state, socket.userId)) {
+        acknowledge({ status: 'error', message: 'Нельзя редактировать сообщение' });
+        return;
+      }
+
+      message.body = String(body ?? '');
+      message.edited = true;
+      acknowledge({ status: 'ok' });
+      emitToChannel(app, channel, 'messageEdited', message);
+    });
+
+    socket.on('deleteMessage', ({ messageId }, acknowledge = _.noop) => {
+      const found = findMessageAndChannel(state, messageId);
+      if (!found) {
+        acknowledge({ status: 'error', message: 'Сообщение не найдено' });
+        return;
+      }
+      const { message, channel } = found;
+      if (!hasAccess(channel, socket.userId)) {
+        acknowledge({ status: 'error', message: 'Доступ запрещён' });
+        return;
+      }
+      const isAuthor = message.userId === socket.userId;
+      if (!isAuthor && !isAdminUser(state, socket.userId)) {
+        acknowledge({ status: 'error', message: 'Нельзя удалить сообщение' });
+        return;
+      }
+
+      state.messages = state.messages.filter((candidate) => candidate.id !== message.id);
+      acknowledge({ status: 'ok' });
+      emitToChannel(app, channel, 'messageDeleted', {
+        messageId: message.id,
+        channelId: channel.id,
+      });
+    });
+
+    socket.on('pinMessage', ({ messageId, pinned }, acknowledge = _.noop) => {
+      const found = findMessageAndChannel(state, messageId);
+      if (!found) {
+        acknowledge({ status: 'error', message: 'Сообщение не найдено' });
+        return;
+      }
+      const { message, channel } = found;
+      if (!hasAccess(channel, socket.userId)) {
+        acknowledge({ status: 'error', message: 'Доступ запрещён' });
+        return;
+      }
+      const pinAllowed = isPrivateChannel(channel) || isAdminUser(state, socket.userId);
+      if (!pinAllowed) {
+        acknowledge({ status: 'error', message: 'Нельзя закрепить сообщение' });
+        return;
+      }
+
+      message.pinned = Boolean(pinned);
+      acknowledge({ status: 'ok' });
+      emitToChannel(app, channel, 'messagePinned', {
+        messageId: message.id,
+        channelId: channel.id,
+        pinned: message.pinned,
+      });
     });
 
     socket.on('newChannel', (channel, acknowledge = _.noop) => {
@@ -245,7 +341,7 @@ export default (app, defaultState = {}) => {
     }
 
     const newUser = {
-      id: getNextId(), username, email, password, avatarUrl: null, contacts: [],
+      id: getNextId(), username, email, password, avatarUrl: null, contacts: [], role: 'user',
     };
     const token = app.jwt.sign({ userId: newUser.id });
     state.users.push(newUser);
