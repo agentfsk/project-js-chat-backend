@@ -167,16 +167,39 @@ export default (app, defaultState = {}) => {
         return;
       }
 
+      const { replyToId, ...messageFields } = message;
+      let replyTo;
+      if (replyToId !== undefined) {
+        const target = findMessageAndChannel(state, replyToId);
+        if (!target || !hasAccess(target.channel, socket.userId)) {
+          acknowledge({ status: 'error', message: 'Сообщение для ответа не найдено' });
+          return;
+        }
+        replyTo = {
+          id: target.message.id,
+          body: target.message.body,
+          username: target.message.username,
+          userId: target.message.userId,
+        };
+        if (target.message.attachment) {
+          replyTo.attachment = target.message.attachment;
+        }
+      }
+
       const sender = state.users.find((candidate) => candidate.id === socket.userId);
       const messageWithId = {
-        ...message,
+        ...messageFields,
         id: getNextId(),
         userId: socket.userId,
         username: message.username || (sender ? sender.username : ''),
         createdAt: new Date().toISOString(),
         edited: false,
         pinned: false,
+        reactions: [],
       };
+      if (replyTo) {
+        messageWithId.replyTo = replyTo;
+      }
       // @ts-ignore
       state.messages.push(messageWithId);
       acknowledge({ status: 'ok' });
@@ -263,6 +286,37 @@ export default (app, defaultState = {}) => {
         channelId: channel.id,
         pinned: message.pinned,
       });
+    });
+
+    socket.on('toggleReaction', ({ messageId, emoji }, acknowledge = _.noop) => {
+      const found = findMessageAndChannel(state, messageId);
+      if (!found) {
+        acknowledge({ status: 'error', message: 'Сообщение не найдено' });
+        return;
+      }
+      const { message, channel } = found;
+      if (!hasAccess(channel, socket.userId)) {
+        acknowledge({ status: 'error', message: 'Доступ запрещён' });
+        return;
+      }
+
+      const emojiValue = String(emoji ?? '');
+      if (!emojiValue) {
+        acknowledge({ status: 'error', message: 'Недопустимая реакция' });
+        return;
+      }
+
+      message.reactions ||= [];
+      const reactionIndex = message.reactions.findIndex(
+        (entry) => entry.userId === socket.userId && entry.emoji === emojiValue,
+      );
+      if (reactionIndex !== -1) {
+        message.reactions.splice(reactionIndex, 1);
+      } else {
+        message.reactions.push({ userId: socket.userId, emoji: emojiValue });
+      }
+      acknowledge({ status: 'ok' });
+      emitToChannel(app, channel, 'messageReacted', message);
     });
 
     socket.on('newChannel', (channel, acknowledge = _.noop) => {
