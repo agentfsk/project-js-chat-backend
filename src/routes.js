@@ -51,6 +51,18 @@ const findPrivateChannel = (state, firstId, secondId) => (
   ))
 );
 
+const findCall = (state, callId) => state.calls.find((call) => call.callId === callId);
+
+const userInLiveCall = (state, userId) => state.calls.some(
+  (call) => call.callerId === userId || call.calleeId === userId,
+);
+
+const isCallParticipant = (call, userId) => Boolean(call && (
+  call.callerId === userId || call.calleeId === userId
+));
+
+const getCallPeer = (call, userId) => (call.callerId === userId ? call.calleeId : call.callerId);
+
 const getOrCreatePrivateChannel = (state, firstId, secondId) => {
   const existing = findPrivateChannel(state, firstId, secondId);
   if (existing) return existing;
@@ -119,6 +131,7 @@ const buildState = (defaultState) => {
     messages: [],
     currentChannelId: generalChannelId,
     contactRequests: [],
+    calls: [],
     users: [
       {
         id: 1,
@@ -359,6 +372,110 @@ export default (app, defaultState = {}) => {
 
       acknowledge({ status: 'ok' });
       emitToChannel(app, channel, 'renameChannel', channel);
+    });
+
+    socket.on('callOffer', ({ callId, channelId, mode, sdp }, acknowledge = _.noop) => {
+      const channel = state.channels.find((c) => c.id === Number(channelId));
+      if (!channel || !isPrivateChannel(channel)) {
+        acknowledge({ status: 'error', message: 'Звонок доступен только в личных чатах' });
+        return;
+      }
+      if (!hasAccess(channel, socket.userId)) {
+        acknowledge({ status: 'error', message: 'Доступ запрещён' });
+        return;
+      }
+      const calleeId = channel.participants.find((id) => id !== socket.userId);
+      const callee = state.users.find((user) => user.id === calleeId);
+      if (!callee) {
+        acknowledge({ status: 'error', message: 'Собеседник не найден' });
+        return;
+      }
+      const calleeRoom = app.io.sockets.adapter.rooms.get(`user:${calleeId}`);
+      if (!calleeRoom || calleeRoom.size === 0) {
+        acknowledge({ status: 'ok', data: { outcome: 'offline' } });
+        return;
+      }
+      if (userInLiveCall(state, calleeId)) {
+        acknowledge({ status: 'ok', data: { outcome: 'busy' } });
+        return;
+      }
+      const caller = state.users.find((user) => user.id === socket.userId);
+      state.calls.push({
+        callId,
+        callerId: socket.userId,
+        calleeId,
+        channelId: channel.id,
+        mode: mode === 'video' ? 'video' : 'audio',
+        phase: 'ringing',
+      });
+      app.io.to(`user:${calleeId}`).emit('callIncoming', {
+        callId,
+        channelId: channel.id,
+        mode: mode === 'video' ? 'video' : 'audio',
+        peer: publicProfile(caller || callee),
+        sdp,
+      });
+      acknowledge({ status: 'ok', data: { outcome: 'ringing' } });
+    });
+
+    socket.on('callAnswer', ({ callId, sdp }, acknowledge = _.noop) => {
+      const call = findCall(state, callId);
+      if (!call || call.calleeId !== socket.userId) {
+        acknowledge({ status: 'error', message: 'Звонок не найден' });
+        return;
+      }
+      call.phase = 'active';
+      app.io.to(`user:${call.callerId}`).emit('callAnswered', { callId, sdp });
+      app.io.to(`user:${call.calleeId}`).emit('callActive', { callId });
+      acknowledge({ status: 'ok' });
+    });
+
+    socket.on('callSignal', ({ callId, data }, acknowledge = _.noop) => {
+      const call = findCall(state, callId);
+      if (!isCallParticipant(call, socket.userId)) {
+        acknowledge({ status: 'ok' });
+        return;
+      }
+      const peerId = getCallPeer(call, socket.userId);
+      app.io.to(`user:${peerId}`).emit('callSignal', { callId, data });
+      acknowledge({ status: 'ok' });
+    });
+
+    socket.on('callReject', ({ callId }, acknowledge = _.noop) => {
+      const call = findCall(state, callId);
+      if (call && call.calleeId === socket.userId) {
+        app.io.to(`user:${call.callerId}`).emit('callRejected', { callId });
+        state.calls = state.calls.filter((entry) => entry.callId !== callId);
+      }
+      acknowledge({ status: 'ok' });
+    });
+
+    socket.on('callHangup', ({ callId, reason = 'hangup' }, acknowledge = _.noop) => {
+      const call = findCall(state, callId);
+      if (isCallParticipant(call, socket.userId)) {
+        const peerId = getCallPeer(call, socket.userId);
+        app.io.to(`user:${peerId}`).emit('callEnded', { callId, reason });
+        state.calls = state.calls.filter((entry) => entry.callId !== callId);
+      }
+      acknowledge({ status: 'ok' });
+    });
+
+    socket.on('disconnect', () => {
+      const liveCalls = state.calls.filter(
+        (call) => call.callerId === socket.userId || call.calleeId === socket.userId,
+      );
+      if (liveCalls.length === 0) return;
+      const room = app.io.sockets.adapter.rooms.get(`user:${socket.userId}`);
+      const otherSocketsConnected = Boolean(room && [...room].some((id) => id !== socket.id));
+      if (otherSocketsConnected) return;
+      liveCalls.forEach((call) => {
+        const peerId = getCallPeer(call, socket.userId);
+        app.io.to(`user:${peerId}`).emit('callEnded', {
+          callId: call.callId,
+          reason: 'disconnected',
+        });
+        state.calls = state.calls.filter((entry) => entry.callId !== call.callId);
+      });
     });
   });
 
