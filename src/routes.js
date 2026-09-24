@@ -374,7 +374,9 @@ export default (app, defaultState = {}) => {
       emitToChannel(app, channel, 'renameChannel', channel);
     });
 
-    socket.on('callOffer', ({ callId, channelId, mode, sdp }, acknowledge = _.noop) => {
+    socket.on('callOffer', ({
+      callId, channelId, mode, sdp,
+    }, acknowledge = _.noop) => {
       const channel = state.channels.find((c) => c.id === Number(channelId));
       if (!channel || !isPrivateChannel(channel)) {
         acknowledge({ status: 'error', message: 'Звонок доступен только в личных чатах' });
@@ -404,6 +406,8 @@ export default (app, defaultState = {}) => {
         callId,
         callerId: socket.userId,
         calleeId,
+        callerSocketId: socket.id,
+        calleeSocketId: null,
         channelId: channel.id,
         mode: mode === 'video' ? 'video' : 'audio',
         phase: 'ringing',
@@ -425,6 +429,7 @@ export default (app, defaultState = {}) => {
         return;
       }
       call.phase = 'active';
+      call.calleeSocketId = socket.id;
       app.io.to(`user:${call.callerId}`).emit('callAnswered', { callId, sdp });
       app.io.to(`user:${call.calleeId}`).emit('callActive', { callId });
       acknowledge({ status: 'ok' });
@@ -461,19 +466,20 @@ export default (app, defaultState = {}) => {
     });
 
     socket.on('disconnect', () => {
-      const liveCalls = state.calls.filter(
-        (call) => call.callerId === socket.userId || call.calleeId === socket.userId,
+      const socketCalls = state.calls.filter(
+        (call) => call.callerSocketId === socket.id || call.calleeSocketId === socket.id,
       );
-      if (liveCalls.length === 0) return;
-      const room = app.io.sockets.adapter.rooms.get(`user:${socket.userId}`);
-      const otherSocketsConnected = Boolean(room && [...room].some((id) => id !== socket.id));
-      if (otherSocketsConnected) return;
-      liveCalls.forEach((call) => {
-        const peerId = getCallPeer(call, socket.userId);
-        app.io.to(`user:${peerId}`).emit('callEnded', {
-          callId: call.callId,
-          reason: 'disconnected',
-        });
+      if (socketCalls.length === 0) return;
+      socketCalls.forEach((call) => {
+        const peerSocketId = call.callerSocketId === socket.id
+          ? call.calleeSocketId
+          : call.callerSocketId;
+        if (peerSocketId) {
+          app.io.to(peerSocketId).emit('callEnded', {
+            callId: call.callId,
+            reason: 'disconnected',
+          });
+        }
         state.calls = state.calls.filter((entry) => entry.callId !== call.callId);
       });
     });
@@ -548,6 +554,17 @@ export default (app, defaultState = {}) => {
           channelId: request.channelId,
         };
       });
+    const outgoingRequests = state.contactRequests
+      .filter((request) => request.fromUserId === user.id)
+      .map((request) => {
+        const toUser = state.users.find((candidate) => candidate.id === request.toUserId);
+        return {
+          id: request.id,
+          to: publicProfile(toUser),
+          channelId: request.channelId,
+          status: request.status,
+        };
+      });
 
     let { currentChannelId } = state;
     if (!channelIds.has(currentChannelId) && channels.length > 0) {
@@ -563,6 +580,7 @@ export default (app, defaultState = {}) => {
         me: publicProfile(user),
         contacts,
         requests,
+        outgoingRequests,
       });
   });
 
