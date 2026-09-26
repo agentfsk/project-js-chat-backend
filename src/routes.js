@@ -90,6 +90,31 @@ const findMessageAndChannel = (state, messageId) => {
   return { message, channel };
 };
 
+// Read state is per user and lives only as long as the messages it refers to.
+const getReadState = (state, userId) => {
+  const key = String(userId);
+  // @ts-ignore
+  if (!state.reads[key]) {
+    // @ts-ignore
+    // eslint-disable-next-line no-param-reassign
+    state.reads[key] = { firstSeenAt: new Date().toISOString(), byChannel: {} };
+  }
+  // @ts-ignore
+  return state.reads[key];
+};
+
+const describeReadState = (state, userId) => {
+  const readState = getReadState(state, userId);
+  return {
+    firstSeenAt: readState.firstSeenAt,
+    // An array, not an object: JSON object keys would turn the numeric channel
+    // ids into strings and break the typed pairing on the client.
+    lastReadAtByChannel: Object.entries(readState.byChannel).map(
+      ([channelId, lastReadAt]) => ({ channelId: Number(channelId), lastReadAt }),
+    ),
+  };
+};
+
 const renderLanding = (port) => `<!doctype html>
 <html lang="ru">
 <head>
@@ -132,6 +157,7 @@ const buildState = (defaultState) => {
     currentChannelId: generalChannelId,
     contactRequests: [],
     calls: [],
+    reads: {},
     users: [
       {
         id: 1,
@@ -465,6 +491,26 @@ export default (app, defaultState = {}) => {
       acknowledge({ status: 'ok' });
     });
 
+    socket.on('readChannel', ({ channelId }, acknowledge = _.noop) => {
+      const channel = state.channels.find((c) => c.id === Number(channelId));
+      if (!channel) {
+        acknowledge({ status: 'error', message: 'Канал не найден' });
+        return;
+      }
+      if (!hasAccess(channel, socket.userId)) {
+        acknowledge({ status: 'error', message: 'Доступ запрещён' });
+        return;
+      }
+
+      const lastReadAt = new Date().toISOString();
+      // @ts-ignore
+      getReadState(state, socket.userId).byChannel[channel.id] = lastReadAt;
+      acknowledge({ status: 'ok' });
+
+      // Read state is private, so only the reader's own sessions hear about it.
+      app.io.to(`user:${socket.userId}`).emit('channelRead', { channelId: channel.id, lastReadAt });
+    });
+
     socket.on('disconnect', () => {
       const socketCalls = state.calls.filter(
         (call) => call.callerSocketId === socket.id || call.calleeSocketId === socket.id,
@@ -587,6 +633,7 @@ export default (app, defaultState = {}) => {
         contacts,
         requests,
         outgoingRequests,
+        readState: describeReadState(state, user.id),
       });
   });
 
