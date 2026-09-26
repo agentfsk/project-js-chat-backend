@@ -471,11 +471,17 @@ export default (app, defaultState = {}) => {
       );
       if (socketCalls.length === 0) return;
       socketCalls.forEach((call) => {
+        const peerId = call.callerSocketId === socket.id ? call.calleeId : call.callerId;
         const peerSocketId = call.callerSocketId === socket.id
           ? call.calleeSocketId
           : call.callerSocketId;
         if (peerSocketId) {
           app.io.to(peerSocketId).emit('callEnded', {
+            callId: call.callId,
+            reason: 'disconnected',
+          });
+        } else {
+          app.io.to(`user:${peerId}`).emit('callEnded', {
             callId: call.callId,
             reason: 'disconnected',
           });
