@@ -25,8 +25,13 @@ const isAdminUser = (state, userId) => {
   return Boolean(user && user.role === 'admin');
 };
 
+const channelKind = (channel) => channel.kind ?? (channel.private ? 'direct' : 'public');
+
+const isGroup = (channel) => channelKind(channel) === 'group';
+
 const isPrivateChannel = (channel) => (
-  Boolean(channel.private) && Array.isArray(channel.participants)
+  ['direct', 'group'].includes(channelKind(channel))
+  && Array.isArray(channel.participants)
 );
 
 const hasAccess = (channel, userId) => (
@@ -45,7 +50,7 @@ const emitToChannel = (app, channel, eventName, payload) => {
 
 const findPrivateChannel = (state, firstId, secondId) => (
   state.channels.find((channel) => (
-    isPrivateChannel(channel)
+    channelKind(channel) === 'direct'
     && channel.participants.includes(firstId)
     && channel.participants.includes(secondId)
   ))
@@ -73,6 +78,7 @@ const getOrCreatePrivateChannel = (state, firstId, secondId) => {
     name: peer ? peer.username : 'ЛС',
     removable: false,
     private: true,
+    kind: 'direct',
     participants: [firstId, secondId],
   };
   state.channels.push(channel);
@@ -80,6 +86,39 @@ const getOrCreatePrivateChannel = (state, firstId, secondId) => {
 };
 
 const getCurrentUser = (req, state) => state.users.find((user) => user.id === req.user.userId);
+
+const isGroupOwner = (channel, userId) => (
+  isGroup(channel) && channel.ownerId === userId
+);
+
+const isGroupAdmin = (channel, userId) => (
+  isGroup(channel) && channel.admins.includes(userId)
+);
+
+const canModerateGroup = (channel, userId) => (
+  isGroupOwner(channel, userId) || isGroupAdmin(channel, userId)
+);
+
+// A moderation target is a plain member: not the owner and not another admin.
+const isModerationTarget = (channel, targetId) => (
+  channel.participants.includes(targetId)
+  && channel.ownerId !== targetId
+  && !channel.admins.includes(targetId)
+);
+
+// Recomrades a group channel's member profiles from its participant ids so the
+// client can render the member list without extra lookups.
+const syncGroupMembers = (state, channel) => {
+  // eslint-disable-next-line no-param-reassign
+  channel.members = channel.participants
+    .map((id) => state.users.find((user) => user.id === id))
+    .filter(Boolean)
+    .map(publicProfile);
+};
+
+const rejectCommand = (acknowledge, message) => {
+  acknowledge({ status: 'error', message });
+};
 
 const findMessageAndChannel = (state, messageId) => {
   const id = Number(messageId);
@@ -206,6 +245,14 @@ export default (app, defaultState = {}) => {
         return;
       }
 
+      if (isGroup(channel)) {
+        const mute = channel.muted.find((entry) => entry.userId === socket.userId);
+        if (mute && new Date(mute.mutedUntil).getTime() > Date.now()) {
+          rejectCommand(acknowledge, 'Вы заглушены в этой группе');
+          return;
+        }
+      }
+
       const { replyToId, ...messageFields } = message;
       let replyTo;
       if (replyToId !== undefined) {
@@ -312,7 +359,8 @@ export default (app, defaultState = {}) => {
         acknowledge({ status: 'error', message: 'Доступ запрещён' });
         return;
       }
-      const pinAllowed = isPrivateChannel(channel) || isAdminUser(state, socket.userId);
+      const pinAllowed = !isGroup(channel)
+        && (isPrivateChannel(channel) || isAdminUser(state, socket.userId));
       if (!pinAllowed) {
         acknowledge({ status: 'error', message: 'Нельзя закрепить сообщение' });
         return;
@@ -361,6 +409,7 @@ export default (app, defaultState = {}) => {
     socket.on('newChannel', (channel, acknowledge = _.noop) => {
       const channelWithId = {
         ...channel,
+        kind: 'public',
         removable: true,
         id: getNextId(),
       };
@@ -400,11 +449,212 @@ export default (app, defaultState = {}) => {
       emitToChannel(app, channel, 'renameChannel', channel);
     });
 
+    socket.on('createGroup', ({
+      name, description, avatarUrl, memberIds,
+    }, acknowledge = _.noop) => {
+      const creator = state.users.find((user) => user.id === socket.userId);
+      if (!creator) {
+        rejectCommand(acknowledge, 'Пользователь не найден');
+        return;
+      }
+
+      const trimmedName = String(name ?? '').trim();
+      if (!trimmedName) {
+        rejectCommand(acknowledge, 'Введите название группы');
+        return;
+      }
+
+      const memberSet = new Set(Array.from(memberIds ?? [], (id) => Number(id)));
+      memberSet.delete(socket.userId);
+      const members = [...memberSet];
+      if (members.length === 0) {
+        rejectCommand(acknowledge, 'Выберите хотя бы одного участника');
+        return;
+      }
+      if (members.some((memberId) => !creator.contacts.includes(memberId))) {
+        rejectCommand(acknowledge, 'Можно добавить только своих контактов');
+        return;
+      }
+
+      const channel = {
+        id: getNextId(),
+        kind: 'group',
+        name: trimmedName,
+        description: description ? String(description).trim() : '',
+        avatarUrl: avatarUrl ? String(avatarUrl) : null,
+        removable: false,
+        private: true,
+        ownerId: socket.userId,
+        admins: [],
+        muted: [],
+        participants: [socket.userId, ...members],
+        members: [],
+      };
+      syncGroupMembers(state, channel);
+      state.channels.push(channel);
+      acknowledge({ status: 'ok', data: channel });
+      emitToChannel(app, channel, 'channelUpdated', channel);
+    });
+
+    socket.on('editGroup', ({
+      channelId, name, description, avatarUrl,
+    }, acknowledge = _.noop) => {
+      const channel = state.channels.find((c) => c.id === Number(channelId));
+      if (!channel || !isGroup(channel)) {
+        rejectCommand(acknowledge, 'Группа не найдена');
+        return;
+      }
+      if (!isGroupOwner(channel, socket.userId)) {
+        rejectCommand(acknowledge, 'Только владелец может изменять группу');
+        return;
+      }
+      if (name !== undefined) {
+        const trimmedName = String(name ?? '').trim();
+        if (!trimmedName) {
+          rejectCommand(acknowledge, 'Введите название группы');
+          return;
+        }
+        channel.name = trimmedName;
+      }
+      if (description !== undefined) {
+        channel.description = String(description ?? '').trim();
+      }
+      if (avatarUrl !== undefined) {
+        channel.avatarUrl = avatarUrl ? String(avatarUrl) : null;
+      }
+      acknowledge({ status: 'ok', data: channel });
+      emitToChannel(app, channel, 'channelUpdated', channel);
+    });
+
+    socket.on('removeGroup', ({ channelId }, acknowledge = _.noop) => {
+      const channel = state.channels.find((c) => c.id === Number(channelId));
+      if (!channel || !isGroup(channel)) {
+        rejectCommand(acknowledge, 'Группа не найдена');
+        return;
+      }
+      if (!isGroupOwner(channel, socket.userId)) {
+        rejectCommand(acknowledge, 'Только владелец может удалить группу');
+        return;
+      }
+      // Membership is still intact while this is emitted, so every participant
+      // hears the removal.
+      emitToChannel(app, channel, 'channelRemoved', { id: channel.id });
+      state.channels = state.channels.filter((c) => c.id !== channel.id);
+      state.messages = state.messages.filter((m) => m.channelId !== channel.id);
+      acknowledge({ status: 'ok' });
+    });
+
+    socket.on('inviteToGroup', ({ channelId, memberIds }, acknowledge = _.noop) => {
+      const channel = state.channels.find((c) => c.id === Number(channelId));
+      if (!channel || !isGroup(channel)) {
+        rejectCommand(acknowledge, 'Группа не найдена');
+        return;
+      }
+      if (!isGroupOwner(channel, socket.userId)) {
+        rejectCommand(acknowledge, 'Только владелец может приглашать участников');
+        return;
+      }
+      const owner = state.users.find((user) => user.id === socket.userId);
+      const invited = Array.from(memberIds ?? [], (id) => Number(id));
+      if (invited.some((memberId) => !owner.contacts.includes(memberId))) {
+        rejectCommand(acknowledge, 'Можно пригласить только своих контактов');
+        return;
+      }
+      invited.forEach((memberId) => {
+        if (!channel.participants.includes(memberId)) channel.participants.push(memberId);
+      });
+      syncGroupMembers(state, channel);
+      acknowledge({ status: 'ok' });
+      emitToChannel(app, channel, 'channelUpdated', channel);
+    });
+
+    socket.on('kickFromGroup', ({ channelId, userId }, acknowledge = _.noop) => {
+      const channel = state.channels.find((c) => c.id === Number(channelId));
+      if (!channel || !isGroup(channel)) {
+        rejectCommand(acknowledge, 'Группа не найдена');
+        return;
+      }
+      const targetId = Number(userId);
+      if (!isGroupOwner(channel, socket.userId) || !isModerationTarget(channel, targetId)) {
+        rejectCommand(acknowledge, 'Нет прав на удаление участника');
+        return;
+      }
+      channel.participants = channel.participants.filter((id) => id !== targetId);
+      channel.admins = channel.admins.filter((id) => id !== targetId);
+      channel.muted = channel.muted.filter((entry) => entry.userId !== targetId);
+      syncGroupMembers(state, channel);
+      acknowledge({ status: 'ok' });
+      // The removed user is no longer a participant, so the shared broadcast
+      // would miss them; signal their row removal directly.
+      app.io.to(`user:${targetId}`).emit('channelRemoved', { id: channel.id });
+      emitToChannel(app, channel, 'channelUpdated', channel);
+    });
+
+    socket.on('setGroupAdmin', ({ channelId, userId, admin }, acknowledge = _.noop) => {
+      const channel = state.channels.find((c) => c.id === Number(channelId));
+      if (!channel || !isGroup(channel)) {
+        rejectCommand(acknowledge, 'Группа не найдена');
+        return;
+      }
+      const targetId = Number(userId);
+      if (!isGroupOwner(channel, socket.userId) || channel.ownerId === targetId) {
+        rejectCommand(acknowledge, 'Нет прав на изменение ролей');
+        return;
+      }
+      if (!channel.participants.includes(targetId)) {
+        rejectCommand(acknowledge, 'Участник не найден');
+        return;
+      }
+      channel.admins = channel.admins.filter((id) => id !== targetId);
+      if (admin) channel.admins.push(targetId);
+      acknowledge({ status: 'ok' });
+      emitToChannel(app, channel, 'channelUpdated', channel);
+    });
+
+    socket.on('muteGroupMember', ({ channelId, userId, until }, acknowledge = _.noop) => {
+      const channel = state.channels.find((c) => c.id === Number(channelId));
+      if (!channel || !isGroup(channel)) {
+        rejectCommand(acknowledge, 'Группа не найдена');
+        return;
+      }
+      const targetId = Number(userId);
+      if (!canModerateGroup(channel, socket.userId) || !isModerationTarget(channel, targetId)) {
+        rejectCommand(acknowledge, 'Нет прав на заглушение участника');
+        return;
+      }
+      const untilDate = new Date(String(until ?? ''));
+      if (Number.isNaN(untilDate.getTime())) {
+        rejectCommand(acknowledge, 'Некорректное время окончания');
+        return;
+      }
+      const untilIso = untilDate.toISOString();
+      channel.muted = channel.muted.filter((entry) => entry.userId !== targetId);
+      channel.muted.push({ userId: targetId, mutedUntil: untilIso });
+      acknowledge({ status: 'ok' });
+      emitToChannel(app, channel, 'channelUpdated', channel);
+    });
+
+    socket.on('unmuteGroupMember', ({ channelId, userId }, acknowledge = _.noop) => {
+      const channel = state.channels.find((c) => c.id === Number(channelId));
+      if (!channel || !isGroup(channel)) {
+        rejectCommand(acknowledge, 'Группа не найдена');
+        return;
+      }
+      const targetId = Number(userId);
+      if (!canModerateGroup(channel, socket.userId) || !isModerationTarget(channel, targetId)) {
+        rejectCommand(acknowledge, 'Нет прав на снятие заглушения');
+        return;
+      }
+      channel.muted = channel.muted.filter((entry) => entry.userId !== targetId);
+      acknowledge({ status: 'ok' });
+      emitToChannel(app, channel, 'channelUpdated', channel);
+    });
+
     socket.on('callOffer', ({
       callId, channelId, mode, sdp,
     }, acknowledge = _.noop) => {
       const channel = state.channels.find((c) => c.id === Number(channelId));
-      if (!channel || !isPrivateChannel(channel)) {
+      if (!channel || channelKind(channel) !== 'direct') {
         acknowledge({ status: 'error', message: 'Звонок доступен только в личных чатах' });
         return;
       }
@@ -720,7 +970,7 @@ export default (app, defaultState = {}) => {
       }
       state.channels.forEach((channel) => {
         if (
-          isPrivateChannel(channel)
+          channelKind(channel) === 'direct'
           && channel.participants.includes(user.id)
           && channel.name === oldUsername
         ) {
