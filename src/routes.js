@@ -467,10 +467,6 @@ export default (app, defaultState = {}) => {
       const memberSet = new Set(Array.from(memberIds ?? [], (id) => Number(id)));
       memberSet.delete(socket.userId);
       const members = [...memberSet];
-      if (members.length === 0) {
-        rejectCommand(acknowledge, 'Выберите хотя бы одного участника');
-        return;
-      }
       if (members.some((memberId) => !creator.contacts.includes(memberId))) {
         rejectCommand(acknowledge, 'Можно добавить только своих контактов');
         return;
