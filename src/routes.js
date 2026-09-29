@@ -95,15 +95,29 @@ const isGroupAdmin = (channel, userId) => (
   isGroup(channel) && channel.admins.includes(userId)
 );
 
-const canModerateGroup = (channel, userId) => (
-  isGroupOwner(channel, userId) || isGroupAdmin(channel, userId)
+const isGroupMember = (channel, userId) => (
+  isGroup(channel) && channel.participants.includes(userId)
 );
 
-// A moderation target is a plain member: not the owner and not another admin.
-const isModerationTarget = (channel, targetId) => (
-  channel.participants.includes(targetId)
+const isGroupAdminTarget = (channel, targetId) => (
+  channel.admins.includes(targetId)
+);
+
+// Muting and voice restoration: the owner reaches any other member, an admin
+// only a plain one, and nobody reaches the owner.
+const canModerateTarget = (channel, actorId, targetId) => {
+  if (!isGroupMember(channel, targetId)) return false;
+  if (channel.ownerId === targetId) return false;
+  if (isGroupOwner(channel, actorId)) return true;
+  if (isGroupAdmin(channel, actorId)) return !isGroupAdminTarget(channel, targetId);
+  return false;
+};
+
+// Removal is the owner's alone, over any other member.
+const canRemoveTarget = (channel, actorId, targetId) => (
+  isGroupOwner(channel, actorId)
+  && isGroupMember(channel, targetId)
   && channel.ownerId !== targetId
-  && !channel.admins.includes(targetId)
 );
 
 // Recomrades a group channel's member profiles from its participant ids so the
@@ -571,7 +585,7 @@ export default (app, defaultState = {}) => {
         return;
       }
       const targetId = Number(userId);
-      if (!isGroupOwner(channel, socket.userId) || !isModerationTarget(channel, targetId)) {
+      if (!canRemoveTarget(channel, socket.userId, targetId)) {
         rejectCommand(acknowledge, 'Нет прав на удаление участника');
         return;
       }
@@ -614,7 +628,7 @@ export default (app, defaultState = {}) => {
         return;
       }
       const targetId = Number(userId);
-      if (!canModerateGroup(channel, socket.userId) || !isModerationTarget(channel, targetId)) {
+      if (!canModerateTarget(channel, socket.userId, targetId)) {
         rejectCommand(acknowledge, 'Нет прав на заглушение участника');
         return;
       }
@@ -637,7 +651,7 @@ export default (app, defaultState = {}) => {
         return;
       }
       const targetId = Number(userId);
-      if (!canModerateGroup(channel, socket.userId) || !isModerationTarget(channel, targetId)) {
+      if (!canModerateTarget(channel, socket.userId, targetId)) {
         rejectCommand(acknowledge, 'Нет прав на снятие заглушения');
         return;
       }
