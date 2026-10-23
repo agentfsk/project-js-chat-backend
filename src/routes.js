@@ -3,7 +3,9 @@
 import _ from 'lodash';
 import HttpErrors from 'http-errors';
 
-import { storeAvatar, storeUpload } from './uploads.js';
+import { sendCallPush, sendGroupCallPush, initFCM } from './fcm.js';
+
+initFCM();
 
 const { Unauthorized, BadRequest } = HttpErrors;
 
@@ -67,6 +69,41 @@ const isCallParticipant = (call, userId) => Boolean(call && (
 ));
 
 const getCallPeer = (call, userId) => (call.callerId === userId ? call.calleeId : call.callerId);
+
+// Group call helpers
+const findGroupCall = (state, callId) => state.groupCalls?.get(callId);
+
+const userInGroupCall = (state, userId) => {
+  for (const groupCall of state.groupCalls?.values() || []) {
+    if (groupCall.peers.has(userId)) return true;
+  }
+  return false;
+};
+
+const isGroupCallParticipant = (groupCall, userId) => Boolean(groupCall && groupCall.peers.has(userId));
+
+const endGroupCall = (state, app, groupCall) => {
+  state.groupCalls.delete(groupCall.callId);
+  const channel = state.channels.find((c) => c.id === groupCall.channelId);
+  if (channel) {
+    channel.participants.forEach((participantId) => {
+      app.io.to(`user:${participantId}`).emit('groupCallEnded', {
+        callId: groupCall.callId,
+        channelId: groupCall.channelId,
+        reason: 'all-left',
+      });
+    });
+  }
+};
+
+const getGroupCallPeerSocketId = (groupCall, userId) => {
+  const peer = groupCall?.peers.get(userId);
+  return peer?.socketId;
+};
+
+const isGroupOwnerOrAdmin = (channel, userId) => (
+  isGroup(channel) && (channel.ownerId === userId || channel.admins.includes(userId))
+);
 
 const getOrCreatePrivateChannel = (state, firstId, secondId) => {
   const existing = findPrivateChannel(state, firstId, secondId);
@@ -210,6 +247,7 @@ const buildState = (defaultState) => {
     currentChannelId: generalChannelId,
     contactRequests: [],
     calls: [],
+    groupCalls: new Map(),
     reads: {},
     users: [
       {
@@ -220,6 +258,11 @@ const buildState = (defaultState) => {
         avatarUrl: null,
         contacts: [],
         role: 'admin',
+        identityKey: null,
+        signedPreKey: null,
+        preKeys: [],
+        preKeySignatures: [],
+        fcmToken: null,
       },
     ],
   };
@@ -660,8 +703,8 @@ export default (app, defaultState = {}) => {
       emitToChannel(app, channel, 'channelUpdated', channel);
     });
 
-    socket.on('callOffer', ({
-      callId, channelId, mode, sdp,
+    socket.on('callOffer', async ({
+      callId, channelId, mode, sdp, keyPackage,
     }, acknowledge = _.noop) => {
       const channel = state.channels.find((c) => c.id === Number(channelId));
       if (!channel || channelKind(channel) !== 'direct') {
@@ -680,6 +723,16 @@ export default (app, defaultState = {}) => {
       }
       const calleeRoom = app.io.sockets.adapter.rooms.get(`user:${calleeId}`);
       if (!calleeRoom || calleeRoom.size === 0) {
+        // Send FCM push notification for offline callee
+        if (callee.fcmToken) {
+          await sendCallPush(callee.fcmToken, {
+            callId,
+            channelId: channel.id,
+            mode,
+            peer: publicProfile(caller || callee),
+            keyPackage,
+          });
+        }
         acknowledge({ status: 'ok', data: { outcome: 'offline' } });
         return;
       }
@@ -688,12 +741,13 @@ export default (app, defaultState = {}) => {
         return;
       }
       const caller = state.users.find((user) => user.id === socket.userId);
+      const calleeSocketId = calleeRoom ? Array.from(calleeRoom)[0] : null;
       state.calls.push({
         callId,
         callerId: socket.userId,
         calleeId,
         callerSocketId: socket.id,
-        calleeSocketId: null,
+        calleeSocketId,
         channelId: channel.id,
         mode: mode === 'video' ? 'video' : 'audio',
         phase: 'ringing',
@@ -704,11 +758,12 @@ export default (app, defaultState = {}) => {
         mode: mode === 'video' ? 'video' : 'audio',
         peer: publicProfile(caller || callee),
         sdp,
+        keyPackage,
       });
       acknowledge({ status: 'ok', data: { outcome: 'ringing' } });
     });
 
-    socket.on('callAnswer', ({ callId, sdp }, acknowledge = _.noop) => {
+    socket.on('callAnswer', ({ callId, sdp, keyPackage }, acknowledge = _.noop) => {
       const call = findCall(state, callId);
       if (!call || call.calleeId !== socket.userId) {
         acknowledge({ status: 'error', message: 'Звонок не найден' });
@@ -716,7 +771,7 @@ export default (app, defaultState = {}) => {
       }
       call.phase = 'active';
       call.calleeSocketId = socket.id;
-      app.io.to(`user:${call.callerId}`).emit('callAnswered', { callId, sdp });
+      app.io.to(`user:${call.callerId}`).emit('callAnswered', { callId, sdp, keyPackage });
       app.io.to(`user:${call.calleeId}`).emit('callActive', { callId });
       acknowledge({ status: 'ok' });
     });
@@ -795,15 +850,277 @@ export default (app, defaultState = {}) => {
         state.calls = state.calls.filter((entry) => entry.callId !== call.callId);
       });
     });
-  });
+
+    // Group call socket handlers
+    socket.on('groupCallCreate', async ({
+      callId, channelId, mode,
+    }, acknowledge = _.noop) => {
+      const channel = state.channels.find((c) => c.id === Number(channelId));
+      if (!channel || channelKind(channel) !== 'group') {
+        acknowledge({ status: 'error', message: 'Групповой звонок доступен только в группах' });
+        return;
+      }
+      if (!hasAccess(channel, socket.userId)) {
+        acknowledge({ status: 'error', message: 'Доступ запрещён' });
+        return;
+      }
+      if (!isGroupOwnerOrAdmin(channel, socket.userId)) {
+        acknowledge({ status: 'error', message: 'Только владелец или админ может начать групповой звонок' });
+        return;
+      }
+
+      const caller = state.users.find((user) => user.id === socket.userId);
+      const finalCallId = callId || `call-${channel.id}-${Date.now()}`;
+      if (findGroupCall(state, finalCallId)) {
+        acknowledge({ status: 'error', message: 'Звонок с таким ID уже существует' });
+        return;
+      }
+      state.groupCalls.set(finalCallId, {
+        callId: finalCallId,
+        channelId: channel.id,
+        mode: mode === 'video' ? 'video' : 'audio',
+        creatorId: socket.userId,
+        peers: new Map([[socket.userId, { socketId: socket.id, joinedAt: new Date(), updates: {} }]]),
+        createdAt: new Date(),
+      });
+
+      app.io.to(`user:${socket.userId}`).emit('groupCallCreated', {
+        callId: finalCallId,
+        channelId: channel.id,
+        mode: mode === 'video' ? 'video' : 'audio',
+      });
+
+      // Notify other group members about the call
+      channel.participants.forEach((participantId) => {
+        if (participantId !== socket.userId) {
+          app.io.to(`user:${participantId}`).emit('groupCallInvite', {
+            callId: finalCallId,
+            channelId: channel.id,
+            mode: mode === 'video' ? 'video' : 'audio',
+            creator: publicProfile(caller),
+          });
+        }
+      });
+
+      // Send FCM push to offline participants
+      channel.participants.forEach((participantId) => {
+        if (participantId !== socket.userId) {
+          const participant = state.users.find((u) => u.id === participantId);
+          if (participant && participant.fcmToken) {
+            const participantRoom = app.io.sockets.adapter.rooms.get(`user:${participantId}`);
+            if (!participantRoom || participantRoom.size === 0) {
+              sendGroupCallPush(participant.fcmToken, {
+                callId: finalCallId,
+                channelId: channel.id,
+                mode: mode === 'video' ? 'video' : 'audio',
+                creator: publicProfile(caller),
+              });
+            }
+          }
+        }
+      });
+
+      acknowledge({ status: 'ok' });
+    });
+
+    socket.on('groupCallJoin', async ({
+      callId, userId, rtpCapabilities,
+    }, acknowledge = _.noop) => {
+      const groupCall = findGroupCall(state, callId);
+      if (!groupCall) {
+        acknowledge({ status: 'error', message: 'Групповой звонок не найден' });
+        return;
+      }
+      const joinerId = Number(userId);
+      if (!groupCall.peers.has(joinerId)) {
+        groupCall.peers.set(joinerId, { socketId: socket.id, joinedAt: new Date(), updates: {} });
+      } else {
+        const peer = groupCall.peers.get(joinerId);
+        peer.socketId = socket.id;
+        if (!peer.updates) peer.updates = {};
+      }
+
+      // Notify other participants
+      for (const [peerId, peer] of groupCall.peers) {
+        if (peerId !== joinerId) {
+          app.io.to(`user:${peerId}`).emit('groupCallPeerJoined', {
+            callId,
+            peer: publicProfile(state.users.find(u => u.id === joinerId)),
+          });
+        }
+      }
+
+      const peers = Array.from(groupCall.peers.entries())
+        .filter(([peerId]) => peerId !== joinerId)
+        .map(([peerId, peer]) => {
+          const peerUser = state.users.find((u) => u.id === peerId);
+          return {
+            userId: peerId,
+            updates: peer.updates || {},
+            profile: peerUser ? publicProfile(peerUser) : null,
+          };
+        });
+
+      acknowledge({
+        status: 'ok',
+        peers: Array.from(groupCall.peers.keys()),
+        profiles: peers,
+        data: { peers: Array.from(groupCall.peers.keys()), profiles: peers },
+      });
+    });
+
+    socket.on('groupCallLeave', async ({
+      callId, userId,
+    }, acknowledge = _.noop) => {
+      const groupCall = findGroupCall(state, callId);
+      if (!groupCall) {
+        acknowledge({ status: 'error', message: 'Групповой звонок не найден' });
+        return;
+      }
+
+      groupCall.peers.delete(Number(userId));
+
+      // Notify other participants
+      for (const [peerId, peer] of groupCall.peers) {
+        app.io.to(`user:${peerId}`).emit('groupCallPeerLeft', { callId, peerId: Number(userId) });
+      }
+
+      // If no participants left, clean up
+      if (groupCall.peers.size === 0) {
+        endGroupCall(state, app, groupCall);
+      }
+
+      acknowledge({ status: 'ok' });
+    });
+
+    socket.on('groupCallPeerUpdate', ({
+      callId, userId, updates,
+    }, acknowledge = _.noop) => {
+      const groupCall = findGroupCall(state, callId);
+      if (!groupCall || !groupCall.peers.has(Number(userId))) {
+        acknowledge({ status: 'error', message: 'Участник не найден в звонке' });
+        return;
+      }
+
+      const channel = state.channels.find((c) => c.id === groupCall.channelId);
+      if (!channel) {
+        acknowledge({ status: 'error', message: 'Канал звонка не найден' });
+        return;
+      }
+      const selfUpdate = Number(userId) === socket.userId;
+      const allowed = selfUpdate || isGroupOwnerOrAdmin(channel, socket.userId);
+      if (!allowed) {
+        acknowledge({ status: 'error', message: 'Недостаточно прав' });
+        return;
+      }
+
+      const peer = groupCall.peers.get(Number(userId));
+      peer.updates = { ...(peer.updates || {}), ...(updates || {}) };
+
+      for (const [peerId] of groupCall.peers) {
+        if (peerId !== socket.userId) {
+          app.io.to(`user:${peerId}`).emit('groupCallPeerUpdate', {
+            callId,
+            peerId: Number(userId),
+            updates,
+          });
+        }
+      }
+
+      acknowledge({ status: 'ok' });
+    });
+
+    socket.on('groupCallKick', ({
+      callId, targetUserId,
+    }, acknowledge = _.noop) => {
+      const groupCall = findGroupCall(state, callId);
+      if (!groupCall) {
+        acknowledge({ status: 'error', message: 'Групповой звонок не найден' });
+        return;
+      }
+      const channel = state.channels.find((c) => c.id === groupCall.channelId);
+      if (!channel) {
+        acknowledge({ status: 'error', message: 'Канал звонка не найден' });
+        return;
+      }
+      if (!isGroupOwnerOrAdmin(channel, socket.userId)) {
+        acknowledge({ status: 'error', message: 'Только владелец или админ может исключать из звонка' });
+        return;
+      }
+      const targetId = Number(targetUserId);
+      if (targetId === groupCall.creatorId) {
+        acknowledge({ status: 'error', message: 'Нельзя исключить создателя звонка' });
+        return;
+      }
+      if (!groupCall.peers.has(targetId)) {
+        acknowledge({ status: 'error', message: 'Участник не найден в звонке' });
+        return;
+      }
+
+      groupCall.peers.delete(targetId);
+      app.io.to(`user:${targetId}`).emit('groupCallKicked', { callId });
+      for (const [peerId] of groupCall.peers) {
+        app.io.to(`user:${peerId}`).emit('groupCallPeerLeft', { callId, peerId: targetId });
+      }
+      if (groupCall.peers.size === 0) {
+        endGroupCall(state, app, groupCall);
+      }
+
+      acknowledge({ status: 'ok' });
+    });
+
+    socket.on('groupCallSignal', ({
+      callId, targetUserId, signal,
+    }, acknowledge = _.noop) => {
+      const groupCall = findGroupCall(state, callId);
+      if (!groupCall || !groupCall.peers.has(Number(targetUserId))) {
+        acknowledge({ status: 'error', message: 'Получатель не найден в звонке' });
+        return;
+      }
+
+      const targetPeer = groupCall.peers.get(Number(targetUserId));
+      if (targetPeer?.socketId) {
+        app.io.to(targetPeer.socketId).emit('groupCallSignal', {
+          callId,
+          fromUserId: socket.userId,
+          signal,
+        });
+      }
+
+      acknowledge({ status: 'ok' });
+    });
+
+    // Handle disconnect for group calls
+    socket.on('disconnect', () => {
+      // Clean up group calls
+      for (const [callId, groupCall] of state.groupCalls) {
+        if (groupCall.peers.has(socket.userId)) {
+          groupCall.peers.delete(socket.userId);
+
+          // Notify other participants
+          for (const [peerId, peer] of groupCall.peers) {
+            app.io.to(`user:${peerId}`).emit('groupCallPeerLeft', { callId, peerId: socket.userId });
+          }
+
+          if (groupCall.peers.size === 0) {
+            endGroupCall(state, app, groupCall);
+          }
+        }
+      }
+    });
+
+  }); // Close app.io.on('connect')
 
   app.post('/api/v1/login', async (req, reply) => {
-    const identifier = _.get(req.body, 'identifier');
+    const username = _.get(req.body, 'username');
     const password = _.get(req.body, 'password');
-    const normalizedEmail = _.trim(String(identifier || '')).toLowerCase();
-    const user = state.users.find((u) => (
-      u.email === normalizedEmail || u.username === identifier
-    ));
+
+    if (!username || !password) {
+      reply.code(400).send({ error: 'Введите ник и пароль' });
+      return;
+    }
+
+    const user = state.users.find((u) => u.username === username);
 
     if (!user || user.password !== password) {
       reply.send(new Unauthorized());
@@ -815,12 +1132,11 @@ export default (app, defaultState = {}) => {
   });
 
   app.post('/api/v1/signup', async (req, reply) => {
-    const email = _.get(req.body, 'email', '').trim().toLowerCase();
     const username = _.get(req.body, 'username');
     const password = _.get(req.body, 'password');
 
-    if (state.users.some((u) => u.email === email)) {
-      reply.code(409).send({ error: 'Этот email уже используется' });
+    if (!username || !password) {
+      reply.code(400).send({ error: 'Введите ник и пароль' });
       return;
     }
 
@@ -830,7 +1146,7 @@ export default (app, defaultState = {}) => {
     }
 
     const newUser = {
-      id: getNextId(), username, email, password, avatarUrl: null, contacts: [], role: 'user',
+      id: getNextId(), username, password, avatarUrl: null, contacts: [], role: 'user',
     };
     const token = app.jwt.sign({ userId: newUser.id });
     state.users.push(newUser);
@@ -883,6 +1199,17 @@ export default (app, defaultState = {}) => {
       currentChannelId = channels[0].id;
     }
 
+    const groupCalls = Array.from(state.groupCalls?.values() || [])
+      .filter((call) => channelIds.has(call.channelId))
+      .map((call) => ({
+        callId: call.callId,
+        channelId: call.channelId,
+        mode: call.mode,
+        creatorId: call.creatorId,
+        participants: Array.from(call.peers.keys()),
+        createdAt: call.createdAt,
+      }));
+
     reply
       .header('Content-Type', 'application/json; charset=utf-8')
       .send({
@@ -894,7 +1221,85 @@ export default (app, defaultState = {}) => {
         requests,
         outgoingRequests,
         readState: describeReadState(state, user.id),
+        groupCalls,
       });
+  });
+
+  app.post('/api/v1/push-token', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+    const token = _.get(req.body, 'token');
+    if (!token) {
+      reply.code(400).send({ error: 'Token is required' });
+      return;
+    }
+    user.fcmToken = token;
+    reply.send({ ok: true });
+  });
+
+  app.get('/api/v1/keys/bundle/:userId', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+    const targetId = Number(req.params.userId);
+    const target = state.users.find((candidate) => candidate.id === targetId);
+    if (!target) {
+      reply.code(404).send({ error: 'User not found' });
+      return;
+    }
+    if (!target.identityKey || !target.signedPreKey) {
+      reply.code(404).send({ error: 'Key bundle not available' });
+      return;
+    }
+    const oneTimePreKey = target.preKeys?.length ? target.preKeys.shift() : null
+    reply.send({
+      identityKey: target.identityKey,
+      signedPreKey: {
+        keyId: target.signedPreKey.keyId,
+        publicKey: target.signedPreKey.publicKey,
+        signature: target.signedPreKey.signature,
+      },
+      oneTimePreKey: oneTimePreKey ? {
+        keyId: oneTimePreKey.keyId,
+        publicKey: oneTimePreKey.publicKey,
+      } : undefined,
+    });
+  });
+
+  app.post('/api/v1/keys/prekeys', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+    const { signedPreKey, oneTimePreKeys } = req.body || {}
+    if (signedPreKey) {
+      user.signedPreKey = signedPreKey
+    }
+    if (oneTimePreKeys) {
+      user.preKeys = oneTimePreKeys
+    }
+    reply.send({ ok: true })
+  });
+
+  app.post('/api/v1/keys/identity', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+    const { identityKey } = req.body || {}
+    if (!identityKey) {
+      reply.code(400).send({ error: 'Identity key required' })
+      return
+    }
+    user.identityKey = identityKey
+    reply.send({ ok: true })
   });
 
   app
@@ -1176,4 +1581,158 @@ export default (app, defaultState = {}) => {
 
     reply.send({ ok: true });
   });
+
+  // Group call REST endpoints
+  app.get('/api/v1/group-calls', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+    if (!req.query.channelId) {
+      reply.code(400).send({ error: 'channelId is required' });
+      return;
+    }
+    const channel = state.channels.find((c) => c.id === Number(req.query.channelId));
+    if (!channel || !hasAccess(channel, user.id)) {
+      reply.code(403).send({ error: 'Access denied' });
+      return;
+    }
+    const calls = Array.from(state.groupCalls.values())
+      .filter((call) => call.channelId === channel.id)
+      .map((call) => ({
+        callId: call.callId,
+        channelId: call.channelId,
+        mode: call.mode,
+        creatorId: call.creatorId,
+        participants: Array.from(call.peers.keys()),
+        createdAt: call.createdAt,
+      }));
+    reply.send({ calls });
+  });
+
+  app.post('/api/v1/group-calls', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+    const { channelId, mode, callId: requestedCallId } = req.body || {};
+    if (!channelId || !mode) {
+      reply.code(400).send({ error: 'channelId and mode are required' });
+      return;
+    }
+    const channel = state.channels.find((c) => c.id === Number(channelId));
+    if (!channel || channelKind(channel) !== 'group') {
+      reply.code(404).send({ error: 'Group not found' });
+      return;
+    }
+    if (!isGroupOwnerOrAdmin(channel, user.id)) {
+      reply.code(403).send({ error: 'Only owner or admin can start group call' });
+      return;
+    }
+
+    const callId = requestedCallId || `group-call-${Date.now()}-${user.id}`;
+    const caller = state.users.find((u) => u.id === user.id);
+    
+    state.groupCalls.set(callId, {
+      callId,
+      channelId: channel.id,
+      mode: mode === 'video' ? 'video' : 'audio',
+      creatorId: user.id,
+      peers: new Map([[user.id, { socketId: null, joinedAt: new Date(), updates: {} }]]),
+      createdAt: new Date(),
+    });
+
+    channel.participants.forEach((participantId) => {
+      if (participantId !== user.id) {
+        app.io.to(`user:${participantId}`).emit('groupCallInvite', {
+          callId,
+          channelId: channel.id,
+          mode: mode === 'video' ? 'video' : 'audio',
+          creator: publicProfile(caller),
+        });
+      }
+    });
+
+    reply.send({ callId, channelId: channel.id, mode });
+  });
+
+  app.get('/api/v1/group-calls/:callId', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+    const callId = req.params.callId;
+    const groupCall = state.groupCalls?.get(callId);
+    if (!groupCall) {
+      reply.code(404).send({ error: 'Group call not found' });
+      return;
+    }
+    const channel = state.channels.find((c) => c.id === groupCall.channelId);
+    if (!channel || !hasAccess(channel, user.id)) {
+      reply.code(403).send({ error: 'Access denied' });
+      return;
+    }
+    reply.send({
+      callId: groupCall.callId,
+      channelId: groupCall.channelId,
+      mode: groupCall.mode,
+      creatorId: groupCall.creatorId,
+      participants: Array.from(groupCall.peers.keys()),
+      createdAt: groupCall.createdAt,
+    });
+  });
+
+  app.post('/api/v1/group-calls/:callId/join', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+    const callId = req.params.callId;
+    const groupCall = state.groupCalls?.get(callId);
+    if (!groupCall) {
+      reply.code(404).send({ error: 'Group call not found' });
+      return;
+    }
+    const channel = state.channels.find((c) => c.id === groupCall.channelId);
+    if (!channel || !hasAccess(channel, user.id)) {
+      reply.code(403).send({ error: 'Access denied' });
+      return;
+    }
+    if (!groupCall.peers.has(user.id)) {
+      groupCall.peers.set(user.id, { socketId: null, joinedAt: new Date(), updates: {} });
+    }
+    reply.send({ 
+      callId: groupCall.callId,
+      channelId: groupCall.channelId,
+      mode: groupCall.mode,
+      participants: Array.from(groupCall.peers.keys()),
+    });
+  });
+
+  app.post('/api/v1/group-calls/:callId/leave', { preValidation: [app.authenticate] }, (req, reply) => {
+    const user = getCurrentUser(req, state);
+    if (!user) {
+      reply.send(new Unauthorized());
+      return;
+    }
+    const callId = req.params.callId;
+    const groupCall = state.groupCalls?.get(callId);
+    if (!groupCall) {
+      reply.code(404).send({ error: 'Group call not found' });
+      return;
+    }
+    groupCall.peers.delete(user.id);
+    for (const [peerId] of groupCall.peers) {
+      app.io.to(`user:${peerId}`).emit('groupCallPeerLeft', { callId, peerId: user.id });
+    }
+    if (groupCall.peers.size === 0) {
+      endGroupCall(state, app, groupCall);
+    }
+    reply.send({ ok: true });
+  });
+
 };
